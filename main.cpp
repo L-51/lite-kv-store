@@ -1,18 +1,64 @@
 #include <iostream>
+#include <limits>
+#include <unordered_map>
 
-// TIP To <b>Run</b> code, press <shortcut actionId="Run"/> or click the <icon src="AllIcons.Actions.Execute"/> icon in the gutter.
+class DB
+{
+    private:
+        std::unordered_map<std::string, std::string> db;
+    public:
+    DB(){}
+        /**
+         * Set method
+         * @param key
+         * @param value
+         */
+        void set(std::string key, std::string value) {db[key] = value;}
+        /**
+         * Get method
+         * @param key
+         * @return Value referenced by key
+         */
+        std::string get(std::string key) {return db[key];}
+};
+
+void err_msg() {
+    std::cerr << "Invalid input\n"
+                             "For example:\n"
+                             "\tSET name John\n"
+                             "\tGET name\n" << std::endl;
+    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+}
+
 
 int main() {
-    // TIP Press <shortcut actionId="RenameElement"/> when your caret is at the <b>lang</b> variable name to see how CLion can help you rename it.
+    DB db;
 
-    const auto lang = "C++";
-    std::cout << "Hello and welcome to " << lang << "!\n";
+    while (true) {
+        std::string order;
+        std::cin >> order;
+        if (order.length() < 3 || (order != "GET" && order != "SET"))
+            std::cerr << "Invalid input -> length <= 3 | order != GET or SET" << std::endl;
+        else{
+            std::string key, value;
+            if (order == "GET") {
+                std::cin >> key;
+                std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+                if (key.length() == 0) err_msg();
+                else std::cout << db.get(key) << std::endl;
+            }
+            else {
+                std::cin >> key >> value;
+                std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+                if (key.length() == 0 || value.length() == 0) err_msg();
+                else {
+                    db.set(key, value);
+                    std::cout << key << " set with value " << value << std::endl;
+                }
+            }
+        }
 
-    for (int i = 1; i <= 5; i++) {
-        // TIP Press <shortcut actionId="Debug"/> to start debugging your code. We have set one <icon src="AllIcons.Debugger.Db_set_breakpoint"/> breakpoint for you, but you can always add more by pressing <shortcut actionId="ToggleLineBreakpoint"/>.
-        std::cout << "i = " << i << std::endl;
     }
 
     return 0;
-    // TIP See CLion help at <a href="https://www.jetbrains.com/help/clion/">jetbrains.com/help/clion/</a>. Also, you can try interactive lessons for CLion by selecting 'Help | Learn IDE Features' from the main menu.
 }
