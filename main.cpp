@@ -2,10 +2,13 @@
 #include <limits>
 #include <unordered_map>
 #include <string>
+#include <shared_mutex>
+#include <mutex>
 
 class DB {
 private:
     std::unordered_map<std::string, std::string> db;
+    mutable std::shared_mutex rw_mutex;
 
 public:
     DB() {}
@@ -16,6 +19,7 @@ public:
      * @param value
      */
     void set(const std::string& key, const std::string& value) {
+        std::unique_lock lock(rw_mutex);
         db[key] = value;
     }
 
@@ -25,6 +29,8 @@ public:
      * @return value associated to the key
      */
     std::string get(const std::string& key) {
+        std::shared_lock lock(rw_mutex);
+
         auto it = db.find(key);
         if (it == db.end()) {
             std::cerr << "Error: Key '" << key << "' does not exist." << std::endl;
