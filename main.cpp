@@ -1,17 +1,35 @@
 #include <iostream>
 #include <limits>
 #include <unordered_map>
-#include <string>
 #include <shared_mutex>
 #include <mutex>
+#include <vector>
 
-class DB {
+struct Shard{
+    std::unordered_map<std::string, std::string> data;
+    std::shared_mutex rw_mutex;
+};
+
+class KVStore {
 private:
-    std::unordered_map<std::string, std::string> db;
-    mutable std::shared_mutex rw_mutex;
+    std::vector<Shard> shards;
+
+    /**
+     * A routing function, to determine which shard the key belongs to
+     * @param key input string
+     * @return the shard index
+     */
+    size_t get_shard_index(const std::string& key) {
+        std::hash<std::string> hasher;
+        return hasher(key) % shards.size();
+    }
 
 public:
-    DB() {}
+    /**
+     * Constructor
+     */
+    KVStore(int num_shards)
+        : shards(num_shards){}
 
     /**
      * Set method
@@ -19,8 +37,11 @@ public:
      * @param value
      */
     void set(const std::string& key, const std::string& value) {
-        std::unique_lock lock(rw_mutex);
-        db[key] = value;
+        size_t index = get_shard_index(key);
+
+        std::unique_lock lock(shards[index].rw_mutex);
+
+        shards[index].data[key] = value;
     }
 
     /**
@@ -29,10 +50,12 @@ public:
      * @return value associated to the key
      */
     std::string get(const std::string& key) {
-        std::shared_lock lock(rw_mutex);
+        size_t index = get_shard_index(key);
 
-        auto it = db.find(key);
-        if (it == db.end()) {
+        std::shared_lock lock(shards[index].rw_mutex);
+
+        auto it = shards[index].data.find(key);
+        if (it == shards[index].data.end()) {
             std::cerr << "Error: Key '" << key << "' does not exist." << std::endl;
             return "";
         }
@@ -48,7 +71,7 @@ void err_msg() {
 }
 
 int main() {
-    DB db;
+    KVStore kv_store(17);
     std::string order;
 
     while (std::cin >> order) {
@@ -62,7 +85,7 @@ int main() {
 
         if (order == "GET") {
             std::cin >> key;
-            std::cout << db.get(key) << std::endl;
+            std::cout << kv_store.get(key) << std::endl;
         }
         else if (order == "SET") {
             std::cin >> key;
@@ -72,7 +95,7 @@ int main() {
             if (key.empty() || value.empty()) {
                 err_msg();
             } else {
-                db.set(key, value);
+                kv_store.set(key, value);
                 std::cout << key << " set with value " << value << std::endl;
             }
         }
