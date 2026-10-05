@@ -4,6 +4,7 @@
 #include <shared_mutex>
 #include <mutex>
 #include <vector>
+#include <thread>
 
 struct Shard{
     std::unordered_map<std::string, std::string> data;
@@ -70,7 +71,31 @@ void err_msg() {
                  "\tGET <key>\n" << std::endl;
 }
 
+void run_stress_test() {
+    KVStore db(17);
+    std::vector<std::thread> threads;
+    int num_threads = 100;
+
+    std::cout << "Starting stress test with " << num_threads << " threads..." << std::endl;
+
+    for (int i = 0; i < num_threads; ++i) {
+        threads.push_back(std::thread([&db, i]() {
+            std::string my_key = "key_" + std::to_string(i);
+            std::string my_value = "value_" + std::to_string(i);
+
+            db.set(my_key, my_value);
+            db.get(my_key);
+        }));
+    }
+
+    for (int i = 0; i < num_threads; ++i) {
+        threads[i].join();
+    }
+    std::cout << "Stress test completed successfully! No deadlocks!" << std::endl;
+}
+
 int main() {
+    /*
     KVStore kv_store(17);
     std::string order;
 
@@ -100,6 +125,8 @@ int main() {
             }
         }
     }
+    */
 
+    run_stress_test();
     return 0;
 }
