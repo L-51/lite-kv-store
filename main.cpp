@@ -8,10 +8,19 @@
 #include <fstream>
 #include <chrono>
 #include <atomic>
+#include <random>
+#include <algorithm>
+#include <numeric>
+
+#ifdef USE_SHARED_MUTEX
+using RWMutex = std::shared_mutex;
+#else
+using RWMutex = std::mutex;
+#endif
 
 struct Shard {
     std::unordered_map<std::string, std::string> data;
-    std::shared_mutex rw_mutex;
+    RWMutex rw_mutex;
 };
 
 // Metrics with prometheus format
@@ -43,18 +52,18 @@ public:
      * @param value
      */
     void set(const std::string& key, const std::string& value) {
-        auto start = std::chrono::high_resolution_clock::now();
+        // auto start = std::chrono::high_resolution_clock::now();
 
         size_t index = get_shard_index(key);
         std::unique_lock lock(shards[index].rw_mutex);
         shards[index].data[key] = value;
         lock.unlock();
 
-        auto end = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-
-        metrics.set_ops_total.fetch_add(1, std::memory_order_relaxed);
-        metrics.total_set_latency_ns.fetch_add(duration, std::memory_order_relaxed);
+        // auto end = std::chrono::high_resolution_clock::now();
+        // auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+        //
+        // metrics.set_ops_total.fetch_add(1, std::memory_order_relaxed);
+        // metrics.total_set_latency_ns.fetch_add(duration, std::memory_order_relaxed);
     }
 
     /**
@@ -63,25 +72,32 @@ public:
      * @return data associate to key
      */
     std::string get(const std::string& key) {
-        auto start = std::chrono::high_resolution_clock::now();
+        // auto start = std::chrono::high_resolution_clock::now();
 
         size_t index = get_shard_index(key);
-        std::shared_lock lock(shards[index].rw_mutex);
+        std::string val;
 
-        auto it = shards[index].data.find(key);
-        metrics.get_ops_total.fetch_add(1, std::memory_order_relaxed);
+        {
+            #ifdef USE_SHARED_MUTEX
+                    std::shared_lock lock(shards[index].rw_mutex);
+            #else
+                    std::lock_guard lock(shards[index].rw_mutex);
+            #endif
 
-        if (it == shards[index].data.end()) {
-            metrics.get_misses_total.fetch_add(1, std::memory_order_relaxed);
-            return "";
+            auto it = shards[index].data.find(key);
+            metrics.get_ops_total.fetch_add(1, std::memory_order_relaxed);
+
+            if (it == shards[index].data.end()) {
+                metrics.get_misses_total.fetch_add(1, std::memory_order_relaxed);
+                return "";
+            }
+
+            val = it->second;
         }
 
-        std::string val = it->second;
-        lock.unlock();
-
-        auto end = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-        metrics.total_get_latency_ns.fetch_add(duration, std::memory_order_relaxed);
+        // auto end = std::chrono::high_resolution_clock::now();
+        // auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+        // metrics.total_get_latency_ns.fetch_add(duration, std::memory_order_relaxed);
 
         return val;
     }
@@ -121,7 +137,11 @@ public:
             return;
         }
         for (size_t i = 0; i < shards.size(); ++i) {
-            std::shared_lock lock(shards[i].rw_mutex);
+            #ifdef USE_SHARED_MUTEX
+                        std::shared_lock lock(shards[i].rw_mutex);
+            #else
+                        std::lock_guard lock(shards[i].rw_mutex);
+            #endif
             for (const auto& pair : shards[i].data)
                 out << pair.first << "=" << pair.second << "\n";
         }
@@ -190,57 +210,145 @@ void run_stress_test(KVStore& db, int num_threads) {
     std::cout << "Stress test completed successfully! No deadlocks!" << std::endl;
 }
 
+/**
+ *
+ * @param db
+ * @param num_threads threads to create
+ * @param operations_per_thread
+ * @param read_percent percentage of operations that are reads
+ * @param key_count number of keys prepared in advance
+ */
+void benchmark(
+    KVStore& db,
+    int num_threads,
+    int operations_per_thread,
+    int read_percent,
+    int key_count)
+{
+    for (int i = 0; i < key_count; ++i) db.set("key_" + std::to_string(i), "initial");
+
+    std::atomic<int> ready{0};
+    std::atomic<bool> start{false};
+
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads);
+
+    for (int t = 0; t < num_threads; ++t) {
+        threads.emplace_back([&, t] {
+            std::mt19937 rng(t);
+            std::uniform_int_distribution<int> key_dist(0, key_count - 1);
+            std::uniform_int_distribution<int> pct_dist(0, 99);
+
+            ++ready;
+            while (!start.load(std::memory_order_acquire))
+                std::this_thread::yield();
+
+            for (int i = 0; i < operations_per_thread; ++i) {
+                std::string key =
+                    "key_" + std::to_string(key_dist(rng));
+
+                if (pct_dist(rng) < read_percent) {
+                    auto value = db.get(key);
+                    (void)value;
+                } else {
+                    db.set(key, "updated");
+                }
+            }
+        });
+    }
+
+    while (ready.load() != num_threads)
+        std::this_thread::yield();
+
+    auto begin = std::chrono::steady_clock::now();
+    start.store(true, std::memory_order_release);
+
+    for (auto& thread : threads) thread.join();
+
+    auto end = std::chrono::steady_clock::now();
+
+    double seconds = std::chrono::duration<double>(end - begin).count();
+
+    auto total_ops = static_cast<uint64_t>(num_threads) * operations_per_thread;
+
+    std::cout
+        << "Threads: " << num_threads
+        << ", Read ratio: " << read_percent << "%"
+        << ", Total operations: " << total_ops
+        << ", Time: " << seconds << " s"
+        << ", Throughput: " << total_ops / seconds
+        << " ops/s\n";
+}
+
 int main() {
     const int NUM_THREADS = 1000;
-    KVStore kv_store(17);
+    KVStore db(17);
     std::string order;
 
-    std::cout << "KV-Store Ready. Type a command (SET, GET, SAVE, LOAD, METRICS, STRESS):" << std::endl;
+    const int operations_per_thread = 100000;
+    const int key_count = 10000;
 
-    while (std::cin >> order) {
-        if (order != "GET" && order != "SET" && order != "SAVE" && order != "LOAD" && order != "METRICS" && order != "STRESS") {
-            std::cerr << "Invalid command." << std::endl;
-            std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-            continue;
-        }
+    for (int threads : {1, 2, 4, 8}) {
+        for (int read_percent : {100, 90, 50, 0}) {
+            std::cout << "\n--- New test ---\n";
 
-        std::string key, value, filename;
-
-        if (order == "GET") {
-            std::cin >> key;
-            std::string res = kv_store.get(key);
-            if (!res.empty()) {
-                std::cout << res << std::endl;
-            } else {
-                std::cout << "(Key not found)" << std::endl;
-            }
-        }
-        else if (order == "SET") {
-            std::cin >> key;
-            std::cin >> std::ws;
-            std::getline(std::cin, value);
-
-            if (key.empty() || value.empty()) err_msg();
-            else {
-                kv_store.set(key, value);
-                std::cout << key << " set with value " << value << std::endl;
-            }
-        }
-        else if (order == "SAVE") {
-            std::cin >> filename;
-            kv_store.save_to_disk(filename);
-        }
-        else if (order == "LOAD") {
-            std::cin >> filename;
-            kv_store.load_from_disk(filename);
-        }
-        else if (order == "METRICS") {
-            kv_store.print_prometheus_metrics();
-        }
-        else if (order == "STRESS") {
-            run_stress_test(kv_store, NUM_THREADS);
+            benchmark(
+                db,
+                threads,
+                operations_per_thread,
+                read_percent,
+                key_count
+            );
         }
     }
+
+
+    // std::cout << "KV-Store Ready. Type a command (SET, GET, SAVE, LOAD, METRICS, STRESS):" << std::endl;
+    //
+    // while (std::cin >> order) {
+    //     if (order != "GET" && order != "SET" && order != "SAVE" && order != "LOAD" && order != "METRICS" && order != "STRESS") {
+    //         std::cerr << "Invalid command." << std::endl;
+    //         std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+    //         continue;
+    //     }
+    //
+    //     std::string key, value, filename;
+    //
+    //     if (order == "GET") {
+    //         std::cin >> key;
+    //         std::string res = db.get(key);
+    //         if (!res.empty()) {
+    //             std::cout << res << std::endl;
+    //         } else {
+    //             std::cout << "(Key not found)" << std::endl;
+    //         }
+    //     }
+    //     else if (order == "SET") {
+    //         std::cin >> key;
+    //         std::cin >> std::ws;
+    //         std::getline(std::cin, value);
+    //
+    //         if (key.empty() || value.empty()) err_msg();
+    //         else {
+    //             db.set(key, value);
+    //             std::cout << key << " set with value " << value << std::endl;
+    //         }
+    //     }
+    //     else if (order == "SAVE") {
+    //         std::cin >> filename;
+    //         db.save_to_disk(filename);
+    //     }
+    //     else if (order == "LOAD") {
+    //         std::cin >> filename;
+    //         db.load_from_disk(filename);
+    //     }
+    //     else if (order == "METRICS") {
+    //         db.print_prometheus_metrics();
+    //     }
+    //     else if (order == "STRESS") {
+    //         run_stress_test(db, NUM_THREADS);
+    //     }
+    // }
 
     return 0;
 }
