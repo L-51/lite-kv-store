@@ -6,32 +6,36 @@
 #include <vector>
 #include <thread>
 #include <fstream>
+#include <chrono>
+#include <atomic>
 
-struct Shard{
+struct Shard {
     std::unordered_map<std::string, std::string> data;
     std::shared_mutex rw_mutex;
+};
+
+// Metrics with prometheus format
+// hardware_destructive_interference_size forcing a cache line for each metric
+struct StoreMetrics {
+    alignas(std::hardware_destructive_interference_size) std::atomic<uint64_t> set_ops_total{0};
+    alignas(std::hardware_destructive_interference_size) std::atomic<uint64_t> get_ops_total{0};
+    alignas(std::hardware_destructive_interference_size) std::atomic<uint64_t> get_misses_total{0};
+    alignas(std::hardware_destructive_interference_size) std::atomic<uint64_t> total_set_latency_ns{0};
+    alignas(std::hardware_destructive_interference_size) std::atomic<uint64_t> total_get_latency_ns{0};
 };
 
 class KVStore {
 private:
     std::vector<Shard> shards;
+    StoreMetrics metrics;
 
-    /**
-     * A routing function, to determine which shard the key belongs to
-     * @param key input string
-     * @return the shard index
-     */
     size_t get_shard_index(const std::string& key) {
         std::hash<std::string> hasher;
         return hasher(key) % shards.size();
     }
 
 public:
-    /**
-     * Constructor
-     */
-    KVStore(int num_shards)
-        : shards(num_shards){}
+    KVStore(int num_shards) : shards(num_shards){}
 
     /**
      * Set method
@@ -39,34 +43,76 @@ public:
      * @param value
      */
     void set(const std::string& key, const std::string& value) {
+        auto start = std::chrono::high_resolution_clock::now();
+
         size_t index = get_shard_index(key);
-
         std::unique_lock lock(shards[index].rw_mutex);
-
         shards[index].data[key] = value;
+        lock.unlock();
+
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+
+        metrics.set_ops_total.fetch_add(1, std::memory_order_relaxed);
+        metrics.total_set_latency_ns.fetch_add(duration, std::memory_order_relaxed);
     }
 
     /**
      * Get method
      * @param key
-     * @return value associated to the key
+     * @return data associate to key
      */
     std::string get(const std::string& key) {
-        size_t index = get_shard_index(key);
+        auto start = std::chrono::high_resolution_clock::now();
 
+        size_t index = get_shard_index(key);
         std::shared_lock lock(shards[index].rw_mutex);
 
         auto it = shards[index].data.find(key);
+        metrics.get_ops_total.fetch_add(1, std::memory_order_relaxed);
+
         if (it == shards[index].data.end()) {
-            std::cerr << "Error: Key '" << key << "' does not exist." << std::endl;
+            metrics.get_misses_total.fetch_add(1, std::memory_order_relaxed);
             return "";
         }
-        return it->second;
+
+        std::string val = it->second;
+        lock.unlock();
+
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+        metrics.total_get_latency_ns.fetch_add(duration, std::memory_order_relaxed);
+
+        return val;
     }
 
     /**
-     * Saving the database in a file with "key=value" format
-     * @param filename the filename to save to
+     * Print the metrics in prometheus format
+     */
+    void print_prometheus_metrics() {
+        uint64_t sets = metrics.set_ops_total.load(std::memory_order_relaxed);
+        uint64_t gets = metrics.get_ops_total.load(std::memory_order_relaxed);
+        uint64_t misses = metrics.get_misses_total.load(std::memory_order_relaxed);
+        uint64_t set_lat = metrics.total_set_latency_ns.load(std::memory_order_relaxed);
+        uint64_t get_lat = metrics.total_get_latency_ns.load(std::memory_order_relaxed);
+
+        double avg_set_ms = sets ? (double)set_lat / sets / 1e6 : 0.0;
+        double avg_get_ms = gets ? (double)get_lat / gets / 1e6 : 0.0;
+
+        std::cout << "\n# HELP kvstore_operations_total Total number of operations shorthand by type.\n"
+                  << "# TYPE kvstore_operations_total counter\n"
+                  << "kvstore_operations_total{type=\"set\"} " << sets << "\n"
+                  << "kvstore_operations_total{type=\"get\"} " << gets << "\n"
+                  << "kvstore_operations_total{type=\"miss\"} " << misses << "\n"
+                  << "# HELP kvstore_average_latency_milliseconds Average operation execution time.\n"
+                  << "# TYPE kvstore_average_latency_milliseconds gauge\n"
+                  << "kvstore_average_latency_milliseconds{type=\"set\"} " << avg_set_ms << "\n"
+                  << "kvstore_average_latency_milliseconds{type=\"get\"} " << avg_get_ms << "\n" << std::endl;
+    }
+
+    /**
+     * Save the data into a local file
+     * @param filename
      */
     void save_to_disk(const std::string& filename) {
         std::ofstream out(filename);
@@ -74,7 +120,7 @@ public:
             std::cerr << "Error: Could not open " << filename << " for writing." << std::endl;
             return;
         }
-        for (int i = 0; i < shards.size(); ++i) {
+        for (size_t i = 0; i < shards.size(); ++i) {
             std::shared_lock lock(shards[i].rw_mutex);
             for (const auto& pair : shards[i].data)
                 out << pair.first << "=" << pair.second << "\n";
@@ -84,8 +130,8 @@ public:
     }
 
     /**
-     * Extract the data from a file
-     * @param filename the filename to load from
+     * Loading data from a local file
+     * @param filename
      */
     void load_from_disk(const std::string& filename) {
         std::ifstream in(filename);
@@ -114,13 +160,17 @@ void err_msg() {
                  "\tSET <key> <value>\n"
                  "\tGET <key>\n"
                  "\tSAVE <filename>\n"
-                 "\tLOAD <filename>\n" << std::endl;
+                 "\tLOAD <filename>\n"
+                 "\tMETRICS\n" << std::endl;
 }
 
-void run_stress_test() {
-    KVStore db(17);
+/**
+ * Stressing function, to test the database db
+ * @param db
+ * @param num_threads
+ */
+void run_stress_test(KVStore& db, int num_threads) {
     std::vector<std::thread> threads;
-    int num_threads = 100;
 
     std::cout << "Starting stress test with " << num_threads << " threads..." << std::endl;
 
@@ -141,13 +191,14 @@ void run_stress_test() {
 }
 
 int main() {
+    const int NUM_THREADS = 1000;
     KVStore kv_store(17);
     std::string order;
 
-    std::cout << "KV-Store Ready. Type a command (SET, GET, SAVE, LOAD):" << std::endl;
+    std::cout << "KV-Store Ready. Type a command (SET, GET, SAVE, LOAD, METRICS, STRESS):" << std::endl;
 
     while (std::cin >> order) {
-        if (order != "GET" && order != "SET" && order != "SAVE" && order != "LOAD") {
+        if (order != "GET" && order != "SET" && order != "SAVE" && order != "LOAD" && order != "METRICS" && order != "STRESS") {
             std::cerr << "Invalid command." << std::endl;
             std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
             continue;
@@ -157,7 +208,12 @@ int main() {
 
         if (order == "GET") {
             std::cin >> key;
-            std::cout << kv_store.get(key) << std::endl;
+            std::string res = kv_store.get(key);
+            if (!res.empty()) {
+                std::cout << res << std::endl;
+            } else {
+                std::cout << "(Key not found)" << std::endl;
+            }
         }
         else if (order == "SET") {
             std::cin >> key;
@@ -169,7 +225,8 @@ int main() {
                 kv_store.set(key, value);
                 std::cout << key << " set with value " << value << std::endl;
             }
-        }else if (order == "SAVE") {
+        }
+        else if (order == "SAVE") {
             std::cin >> filename;
             kv_store.save_to_disk(filename);
         }
@@ -177,8 +234,13 @@ int main() {
             std::cin >> filename;
             kv_store.load_from_disk(filename);
         }
+        else if (order == "METRICS") {
+            kv_store.print_prometheus_metrics();
+        }
+        else if (order == "STRESS") {
+            run_stress_test(kv_store, NUM_THREADS);
+        }
     }
 
-    // run_stress_test();
     return 0;
 }
