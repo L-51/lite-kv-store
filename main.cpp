@@ -285,7 +285,7 @@ int main() {
     KVStore db(17);
     std::string order;
 
-    const int operations_per_thread = 100000;
+    const int operations_per_thread = 5'000'000;
     const int key_count = 10000;
 
     for (int threads : {1, 2, 4, 8}) {
