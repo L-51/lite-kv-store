@@ -11,6 +11,11 @@ A lightweight, extremely fast, and highly concurrent in-memory Key-Value store w
 - **Deadlock Prevention**: Strictly uses RAII principles (`std::unique_lock` and `std::shared_lock`) to guarantee safe resource acquisition and release.
 - **O(1) Time Complexity**: Core storage relies on optimized `std::unordered_map` instances inside each shard for rapid lookups and insertions.
 - **CLI Interface**: Includes a lightweight Read-Eval-Print Loop (REPL) for immediate database interaction.
-
+## Benchmarks
+Tested locally with 17 shards and 5,000,000 operations per thread:
+- **Read-Heavy Workload (100% Reads, 8 Threads):**
+  - `std::shared_mutex`: **19.6 Million ops/sec** (50% faster than standard mutex)
+- **Mixed Workload (50% Reads / 50% Writes, 8 Threads):**
+  - `std::mutex`: **13.3 Million ops/sec** (Outperforms shared_mutex due to reader-writer state switching overhead).
 ## Motivation
 This project was built to demonstrate a deep understanding of memory management, data structures, and multithreading in C++. By transitioning from a monolithic lock to a sharded architecture, this project reflects production-grade concurrency principles essential for high-performance Systems Engineering and backend infrastructure.
